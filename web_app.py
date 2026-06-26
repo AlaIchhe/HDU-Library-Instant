@@ -61,6 +61,35 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 SCHEDULER = None  # Scheduler 实例，main() 中初始化
 
+# Cookie 缓存：避免短时间重复启动 headless 浏览器（TTL 5 分钟）
+_COOKIE_CACHE = {"value": None, "ts": 0}
+_COOKIE_CACHE_TTL = 300
+_COOKIE_CACHE_LOCK = threading.Lock()
+
+
+def get_cookie_cached(preferred_browser="auto"):
+    """带 TTL 缓存的 cookie 获取，避免重复启动 headless 浏览器。"""
+    now = time.time()
+    with _COOKIE_CACHE_LOCK:
+        if _COOKIE_CACHE["value"] and (now - _COOKIE_CACHE["ts"]) < _COOKIE_CACHE_TTL:
+            return _COOKIE_CACHE["value"], ["Cookie: 使用缓存（距上次读取不到 5 分钟）"]
+
+    cookie, logs = _safe_find_hdu_cookie(preferred_browser)
+    with _COOKIE_CACHE_LOCK:
+        if cookie:
+            _COOKIE_CACHE["value"] = cookie
+            _COOKIE_CACHE["ts"] = now
+            if save_cookie_file(cookie):
+                logs.append("已缓存 cookie 到 browser_cookie.json")
+    return cookie, logs
+
+
+def invalidate_cookie_cache():
+    """强制失效 cookie 缓存（供 /api/cookie-status 手动刷新时使用）。"""
+    with _COOKIE_CACHE_LOCK:
+        _COOKIE_CACHE["value"] = None
+        _COOKIE_CACHE["ts"] = 0
+
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -554,9 +583,10 @@ INDEX_HTML = r"""<!doctype html>
       schedStopBtn: $("schedStopBtn"),
     };
 
-    async function checkCookieStatus() {
+    async function checkCookieStatus(forceRefresh = false) {
       try {
-        const data = await requestJson("/api/cookie-status");
+        const url = forceRefresh ? "/api/cookie-status?force=1" : "/api/cookie-status";
+        const data = await requestJson(url);
         // 显示探测日志
         if (data.logs && data.logs.length) {
           appendLog(data.logs);
@@ -622,7 +652,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function startSchedPolling() {
       pollScheduler();
-      schedPollTimer = setInterval(pollScheduler, 2000);
+      schedPollTimer = setInterval(pollScheduler, 5000);
     }
 
     async function startScheduler() {
@@ -657,7 +687,7 @@ INDEX_HTML = r"""<!doctype html>
       schedFields.cookieLabel.className = "";
       appendLog(["========== 获取 Cookie =========="]);
       try {
-        await checkCookieStatus();
+        await checkCookieStatus(true /* forceRefresh */);
       } finally {
         cookieBtn.disabled = false;
         cookieBtn.textContent = "获取cookie";
@@ -822,6 +852,16 @@ INDEX_HTML = r"""<!doctype html>
         const data = await requestJson(`/api/job?id=${encodeURIComponent(jobId)}`);
         fields.logBox.textContent = data.logs.join("\n") + (data.logs.length ? "\n" : "");
         fields.logBox.scrollTop = fields.logBox.scrollHeight;
+
+        // 显示等待进度（定时提交场景）
+        if (data.progress && data.progress.remaining > 0) {
+          const r = data.progress.remaining;
+          const h = Math.floor(r / 3600);
+          const m = Math.floor((r % 3600) / 60);
+          const s = r % 60;
+          setStatus(`等待中 · ${h}h ${m}m ${s}s`, "running");
+        }
+
         if (data.status === "running") {
           pollTimer = setTimeout(() => pollJob(jobId), 350);
           return;
@@ -1001,12 +1041,14 @@ def start_booking_job(payload):
     max_trials = normalize_max_trials(payload.get("max_trials", DEFAULT_MAX_TRIALS))
     retry_delay = normalize_retry_delay(payload.get("retry_delay", DEFAULT_RETRY_DELAY))
 
-    # 自动从浏览器加载 cookie（如果配置允许）
+    # 自动从浏览器加载 cookie（使用缓存避免重复启动 headless 浏览器）
     auto_cookie = (config.get("automation") or {}).get("auto_cookie", True)
     preferred_browser = (config.get("automation") or {}).get("preferred_browser", "auto")
     browser_cookie = None
     if auto_cookie and HAS_COOKIE_BROWSER:
-        browser_cookie, _ = _safe_find_hdu_cookie(preferred_browser)
+        browser_cookie, cache_logs = get_cookie_cached(preferred_browser)
+        for line in cache_logs:
+            append(f"[cookie] {line}")
 
     job_id = str(uuid.uuid4())
     cancel_event = threading.Event()
@@ -1022,15 +1064,27 @@ def start_booking_job(payload):
     with JOBS_LOCK:
         JOBS[job_id] = job
 
+    MAX_LOG_LINES = 2000
+
     def append(message):
         with JOBS_LOCK:
             stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             job["logs"].append(f"[{stamp}] {message}")
+            # 防止长时间运行任务日志无限增长
+            if len(job["logs"]) > MAX_LOG_LINES:
+                del job["logs"][:-MAX_LOG_LINES]
 
     def worker():
         try:
             if browser_cookie:
                 append(f"已从浏览器读取到 cookie ({len(browser_cookie)} 字符)")
+
+            def update_progress(remaining_seconds, target_time):
+                with JOBS_LOCK:
+                    job["progress"] = {
+                        "remaining": remaining_seconds,
+                        "target": target_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
 
             run_booking(
                 config_path=config_path,
@@ -1043,6 +1097,7 @@ def start_booking_job(payload):
                 logger=append,
                 should_cancel=cancel_event.is_set,
                 browser_cookie=browser_cookie,
+                progress_callback=update_progress,
             )
         except Exception as exc:
             with JOBS_LOCK:
@@ -1089,6 +1144,7 @@ def job_snapshot(job_id):
             "error": job["error"],
             "started_at": job["started_at"],
             "finished_at": job["finished_at"],
+            "progress": job.get("progress"),
         }
 
 
@@ -1113,7 +1169,9 @@ class WebHandler(BaseHTTPRequestHandler):
             self.handle_json(booking_form_from_config)
             return
         if parsed.path == "/api/cookie-status":
-            self.handle_json(self.check_cookie_status)
+            query = parse_qs(parsed.query)
+            force = query.get("force", ["0"])[0] == "1"
+            self.handle_json(lambda: self.check_cookie_status(force_refresh=force))
             return
         if parsed.path == "/api/scheduler":
             self.handle_json(self.get_scheduler_state)
@@ -1186,8 +1244,11 @@ class WebHandler(BaseHTTPRequestHandler):
         payload = self.read_json()
         return cancel_job(str(payload.get("job_id") or ""))
 
-    def check_cookie_status(self):
-        """检查浏览器 cookie 是否可用，同时返回探测日志。"""
+    def check_cookie_status(self, force_refresh=False):
+        """检查浏览器 cookie 是否可用，同时返回探测日志。
+
+        force_refresh=True 时跳过缓存强制重新读取（用户点击获取cookie按钮时）。
+        """
         try:
             config = load_config(DEFAULT_CONFIG)
         except Exception:
@@ -1198,11 +1259,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
         logs: list[str] = []
         if auto_cookie and HAS_COOKIE_BROWSER:
-            cookie, logs = _safe_find_hdu_cookie(preferred)
+            if force_refresh:
+                invalidate_cookie_cache()
+            cookie, logs = get_cookie_cached(preferred)
             if cookie:
-                # 读取成功即缓存，供调度器/手动运行在读取失败时兜底
-                if save_cookie_file(cookie):
-                    logs.append("已缓存 cookie 到 browser_cookie.json")
                 return {"available": True, "source": "browser", "logs": logs}
 
         # 回退到配置文件

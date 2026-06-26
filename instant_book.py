@@ -123,6 +123,12 @@ class InstantBooker:
         # 优先使用从浏览器自动读取的 cookie
         if browser_cookie:
             if self._load_cookie_header(browser_cookie):
+                # 浏览器 cookie 已加载，但 uid 可能已在缓存文件中；
+                # 尝试提取以省去后续 resolve_user() 的 HTTP 请求
+                auth = self.config.get("auth") or {}
+                cookie_file = auth.get("cookie_file")
+                if cookie_file and not self.uid:
+                    self._try_load_user_info(cookie_file)
                 return
 
         auth = self.config.get("auth") or {}
@@ -169,6 +175,23 @@ class InstantBooker:
             return False
         self._apply_user_info_candidate(self._find_user_info(data))
         return self._load_cookie_json(data)
+
+    def _try_load_user_info(self, cookie_file):
+        """仅从缓存文件中提取 uid/name，不加载 cookie。"""
+        path = Path(os.path.expanduser(cookie_file))
+        if not path.is_absolute():
+            script_dir = DEFAULT_CONFIG.parent
+            if (script_dir / path).exists():
+                path = script_dir / path
+            else:
+                path = Path.cwd() / path
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        self._apply_user_info_candidate(self._find_user_info(data))
 
     def _load_cookie_json(self, data):
         cookies = data.get("cookies") if isinstance(data, dict) else data
@@ -312,24 +335,26 @@ class InstantBooker:
         if end_hour > max_end:
             raise RuntimeError(f"预约结束时间超出范围：允许最晚到 {max_end}:00")
 
-    def query_seat_map(self, room_detail, begin_time, duration_hours, target_floor_id=None, logger=None):
-        candidates = []
-        seen_candidates = set()
+    def _seat_map_candidates(self, begin_time, duration_hours):
+        """生成候选查询时间（惰性求值，去重）。
 
-        def add_candidate(label, when, hours):
-            candidate = (
-                label,
-                when.replace(minute=0, second=0, microsecond=0),
-                max(1, int(hours)),
-            )
-            key = (int(candidate[1].timestamp()), candidate[2])
-            if key not in seen_candidates:
-                seen_candidates.add(key)
-                candidates.append(candidate)
+        按优先级依次尝试：目标完整时段 → 目标开始1小时 → 目标日08:00 → 当前可用时段。
+        后三项仅在必要时生成（例如凌晨或深夜时"当前可用时段"可能跨天）。
+        """
+        seen = set()
 
-        add_candidate("目标完整时段", begin_time, duration_hours)
-        add_candidate("目标开始1小时", begin_time, 1)
-        add_candidate("目标日08:00", begin_time.replace(hour=8), 1)
+        def _emit(label, when, hours):
+            when = when.replace(minute=0, second=0, microsecond=0)
+            hours = max(1, int(hours))
+            key = (int(when.timestamp()), hours)
+            if key not in seen:
+                seen.add(key)
+                return (label, when, hours)
+            return None
+
+        yield _emit("目标完整时段", begin_time, duration_hours)
+        yield _emit("目标开始1小时", begin_time, 1)
+        yield _emit("目标日08:00", begin_time.replace(hour=8), 1)
 
         now = datetime.now().astimezone()
         if now.hour >= 22:
@@ -338,12 +363,16 @@ class InstantBooker:
             lookup_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
         else:
             lookup_time = now
-        add_candidate("当前可用时段", lookup_time, 1)
+        yield _emit("当前可用时段", lookup_time, 1)
 
+    def query_seat_map(self, room_detail, begin_time, duration_hours, target_floor_id=None, logger=None):
         merged = []
         seen_floor_ids = set()
         last_error = None
-        for label, lookup_time, hours in candidates:
+        for candidate in self._seat_map_candidates(begin_time, duration_hours):
+            if candidate is None:
+                continue
+            label, lookup_time, hours = candidate
             try:
                 floors = self._query_seat_map_once(room_detail, lookup_time, hours)
             except Exception as exc:
@@ -534,7 +563,7 @@ def validate_booking_result(result):
     raise RuntimeError(f"预约失败：{message}{hint}")
 
 
-def wait_until(execute_time, logger=print, should_cancel=None):
+def wait_until(execute_time, logger=print, should_cancel=None, progress_callback=None):
     if execute_time is None:
         return
     logger(f"定时提交：将在 {execute_time.strftime('%Y-%m-%d %H:%M:%S')} 执行")
@@ -546,11 +575,15 @@ def wait_until(execute_time, logger=print, should_cancel=None):
         remaining = (execute_time - now).total_seconds()
         if remaining <= 0:
             break
+        if progress_callback:
+            progress_callback(int(remaining), execute_time)
         current_monotonic = time.monotonic()
         if current_monotonic >= next_notice_at:
             logger(f"未到执行时间，还差 {int(remaining)} 秒，等待中...")
             next_notice_at = current_monotonic + 60
         time.sleep(min(max(remaining, 0.2), 1 if remaining <= 10 else 10))
+    if progress_callback:
+        progress_callback(0, execute_time)
     logger("已到执行时间，开始提交")
 
 
@@ -565,6 +598,7 @@ def run_booking(
     logger=print,
     should_cancel=None,
     browser_cookie=None,
+    progress_callback=None,
 ):
     config = load_config(config_path)
     booking_cfg = config.get("booking") or {}
@@ -635,7 +669,7 @@ def run_booking(
     )
     logger(f"目标时间：{begin_time.strftime('%Y-%m-%d %H:%M')}，{plan['duration_hours']} 小时")
 
-    wait_until(execute_time, logger=logger, should_cancel=should_cancel)
+    wait_until(execute_time, logger=logger, should_cancel=should_cancel, progress_callback=progress_callback)
     check_cancel()
 
     result = None

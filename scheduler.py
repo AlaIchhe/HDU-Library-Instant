@@ -85,14 +85,25 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _run_loop(self):
-        """调度主循环。"""
+        """调度主循环。
+
+        正常路径：_run_once 内部计算下次执行时间并等待，返回后立即循环。
+        异常路径：指数退避（30s → 60s → 120s → 240s → 300s 封顶），
+                  成功后重置计数器，防止瞬态错误引发重试风暴。
+        """
+        consecutive_errors = 0
         while not self._stop_event.is_set():
             try:
                 self._run_once()
+                consecutive_errors = 0  # 成功执行后重置
             except Exception as exc:
-                self._set_state("error", last_result=f"调度异常：{exc}")
-                # 异常后等待 5 分钟再重试
-                if self._stop_event.wait(300):
+                consecutive_errors += 1
+                delay = min(300, 30 * (2 ** min(consecutive_errors - 1, 4)))
+                self._set_state(
+                    "error",
+                    last_result=f"调度异常（#{consecutive_errors}，{delay}s 后重试）：{exc}",
+                )
+                if self._stop_event.wait(delay):
                     return
             else:
                 # 一次执行完成后，等待到下一次
