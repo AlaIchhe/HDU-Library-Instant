@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.port
+booking.log
+_config_backup.yaml
+.DS_Store
+Thumbs.db
+browser_profile/
+browser_cookie.json

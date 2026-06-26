@@ -1,0 +1,64 @@
+# HDU 图书馆即时预约配置
+#
+
+auth:
+  cookie: ''
+  cookie_file: browser_cookie.json
+
+user_info:
+  # 慧图系统内部 uid，不一定等于学号。程序会优先用这里的值。
+  uid: ''
+  name: ''
+
+booking:
+  # 格式：1:floorId:seatNum:startHour:durationHours（roomType 固定为 1=自习室）
+  # 当前默认：自习室、六楼杭韵数阁、130座、13:00 开始、9 小时。
+  plan: 1:1558:298:9:13
+  # 定时提交时间，格式 HH:MM 或 HH:MM:SS；默认像 HDU-Library-Master 一样等到 20:00 提交。
+  # 如果想立即提交，可以在网页里清空这个字段。
+  execute_at: '20:00:00'
+  # 像 HDU-Library-Master 的 maxTrials：到点后最多提交几次。
+  # 只有接口返回“超出可预约座位时间范围”时才会按间隔重试，其他失败不会继续刷。
+  max_trials: 15
+  # 像 HDU-Library-Master 的 delay：时间范围未开放时，等待几秒后再试。
+  retry_delay: 0.5
+  # true 时只查座位并打印将要提交的数据，不真正预约。
+  dry_run: false
+
+request:
+  timeout: 10
+
+session:
+  headers:
+    Accept: application/json, text/plain, */*
+    Accept-Encoding: gzip, deflate, br, zstd
+    Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
+    Connection: keep-alive
+    Content-type: application/x-www-form-urlencoded;charset=UTF-8
+    Host: hdu.huitu.zhishulib.com
+    Origin: https://hdu.huitu.zhishulib.com
+    Referer: https://hdu.huitu.zhishulib.com/
+    Sec-Fetch-Dest: empty
+    Sec-Fetch-Mode: cors
+    Sec-Fetch-Site: same-origin
+    User-Agent: Mozilla/5.0 (Linux; Android 12; Pixel 3 Build/SP1A.210812.016.C2; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 Mobile Safari/537.36 MicroMessenger/8.0.30 Language/zh_CN
+  params:
+    LAB_JSON: '1'
+  trust_env: false
+  verify: false
+
+urls:
+  book_seat: https://hdu.huitu.zhishulib.com/Seat/Index/bookSeats
+  query_rooms: https://hdu.huitu.zhishulib.com/Space/Category/list
+  query_seats: https://hdu.huitu.zhishulib.com/Seat/Index/searchSeats
+  user_base_info: https://hdu.huitu.zhishulib.com/User/Center/baseInfo
+  user_center: https://hdu.huitu.zhishulib.com/User/Center/index
+
+# 自动化配置
+automation:
+  # 是否启用每日自动预约（网页里也能开关）
+  auto_daily: true
+  # 是否自动从浏览器读取 cookie
+  auto_cookie: true
+  # 优先使用的浏览器：chrome / edge / auto（自动检测）
+  preferred_browser: auto
